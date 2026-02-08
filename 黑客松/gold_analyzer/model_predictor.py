@@ -23,7 +23,7 @@ if __name__ == "__main__" and __package__ is None:
         sys.path.insert(0, _pkg_root)
 
 from gold_analyzer.price_fetcher import fetch_gold_prices, get_price_summary, format_price_context
-from gold_analyzer.factor_data import fetch_proxy_data, build_feature_matrix
+from gold_analyzer.factor_data import fetch_proxy_data, build_feature_matrix, ai_select_proxies, FACTOR_PROXY_REGISTRY
 from gold_analyzer.regression import train_and_predict, compute_combined_probability
 
 
@@ -56,6 +56,58 @@ DEFAULT_PROXY_CONFIG = [
 ]
 
 
+# AI 代理指标选择缓存（避免同一日期重复调用 AI）
+_ai_proxy_cache: Dict[str, Any] = {}
+
+
+def _ai_select_proxies_for_date(
+    target_date: str,
+    price_context: str,
+) -> tuple:
+    """
+    让 AI 从 65 个代理指标中选择 8-15 个最相关的，并决定权重和方向。
+    结果会缓存，同一日期不重复调用。
+
+    Returns:
+        (proxy_ids, proxy_config)  或在失败时回退到默认值
+    """
+    if target_date in _ai_proxy_cache:
+        cached = _ai_proxy_cache[target_date]
+        return cached["proxy_ids"], cached["proxy_config"]
+
+    # 构造简化的因素列表（基于价格上下文让 AI 判断当前市场主题）
+    generic_factors = [
+        {"name": "美联储货币政策", "direction": "unknown", "impact_level": "high", "weight": 8},
+        {"name": "美元走势", "direction": "unknown", "impact_level": "high", "weight": 7},
+        {"name": "通胀预期", "direction": "unknown", "impact_level": "medium", "weight": 6},
+        {"name": "地缘政治风险", "direction": "unknown", "impact_level": "medium", "weight": 6},
+        {"name": "市场风险偏好", "direction": "unknown", "impact_level": "medium", "weight": 5},
+        {"name": "黄金ETF资金流", "direction": "unknown", "impact_level": "medium", "weight": 5},
+        {"name": "全球经济增长", "direction": "unknown", "impact_level": "medium", "weight": 4},
+    ]
+
+    try:
+        current_time = (datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d") + " 23:59:59"
+        result = ai_select_proxies(
+            current_date=current_time,
+            target_date=target_date,
+            factors=generic_factors,
+            price_context=price_context,
+        )
+        selected = result.get("selected_proxies", [])
+        if len(selected) >= 5:
+            proxy_ids = [s["proxy_id"] for s in selected]
+            proxy_config = selected
+            _ai_proxy_cache[target_date] = {"proxy_ids": proxy_ids, "proxy_config": proxy_config}
+            return proxy_ids, proxy_config
+    except Exception as e:
+        print(f"    [AI选择失败，回退默认] {e}")
+
+    # 回退到默认
+    _ai_proxy_cache[target_date] = {"proxy_ids": DEFAULT_PROXY_IDS, "proxy_config": DEFAULT_PROXY_CONFIG}
+    return DEFAULT_PROXY_IDS, DEFAULT_PROXY_CONFIG
+
+
 def predict_for_date(
     target_date: str,
     mode: str = "fast",
@@ -69,7 +121,10 @@ def predict_for_date(
 
     Args:
         target_date: 预测目标日期 "YYYY-MM-DD"
-        mode: "fast"（仅回归）或 "full"（回归+AI）
+        mode:
+            - "fast": 固定10个指标 + 回归（最快，无AI调用）
+            - "ai_select": AI从65个指标中选8-15个 + 回归（每个事件多~5s）
+            - "full": AI选指标 + 回归 + AI定性融合（最慢，每个事件~30s）
         lookback_days: 历史数据回看天数
         forecast_horizon: 预测天数（1=明天涨跌）
 
@@ -78,7 +133,7 @@ def predict_for_date(
             "probability_up": float,     # 上涨概率 0~1
             "probability_down": float,   # 下跌概率 0~1
             "prediction": "Up" | "Down",
-            "method": "regression" | "regression+ai" | "fallback",
+            "method": "regression" | "regression+ai_select" | "regression+ai" | "fallback",
             "details": {...}
         }
     """
@@ -98,10 +153,19 @@ def predict_for_date(
     except Exception as e:
         return _fallback_result(f"gold price fetch error: {e}")
 
-    # Step 2: 获取代理指标数据（截至 end_date）
+    # Step 2: 选择代理指标（AI动态选择 或 固定默认）
+    if mode in ("ai_select", "full"):
+        price_summary = get_price_summary(df)
+        price_context = format_price_context(price_summary)
+        proxy_ids, proxy_config = _ai_select_proxies_for_date(target_date, price_context)
+    else:
+        proxy_ids = DEFAULT_PROXY_IDS
+        proxy_config = DEFAULT_PROXY_CONFIG
+
+    # Step 3: 获取代理指标数据（截至 end_date）
     try:
         proxy_data = fetch_proxy_data(
-            proxy_ids=DEFAULT_PROXY_IDS,
+            proxy_ids=proxy_ids,
             end_date=end_date,
             lookback_days=lookback_days,
         )
@@ -110,12 +174,12 @@ def predict_for_date(
     except Exception as e:
         return _fallback_result(f"proxy data fetch error: {e}")
 
-    # Step 3: 构建特征矩阵
+    # Step 4: 构建特征矩阵
     try:
         feature_matrix = build_feature_matrix(
             proxy_data=proxy_data,
             gold_prices=df,
-            selected_proxies=DEFAULT_PROXY_CONFIG,
+            selected_proxies=proxy_config,
             forecast_horizon=forecast_horizon,
         )
         if feature_matrix is None or feature_matrix.empty or len(feature_matrix) < 30:
@@ -123,11 +187,11 @@ def predict_for_date(
     except Exception as e:
         return _fallback_result(f"feature matrix error: {e}")
 
-    # Step 4: 训练回归模型并预测
+    # Step 5: 训练回归模型并预测
     try:
         regression_result = train_and_predict(
             feature_matrix=feature_matrix,
-            selected_proxies=DEFAULT_PROXY_CONFIG,
+            selected_proxies=proxy_config,
             forecast_horizon=forecast_horizon,
         )
         if "error" in regression_result:
@@ -193,13 +257,16 @@ def predict_for_date(
             # AI 失败，退回到纯回归结果
             pass
 
+    method_label = "regression+ai_select" if mode == "ai_select" else "regression"
     return {
         "probability_up": prob_up,
         "probability_down": prob_down,
         "prediction": "Up" if prob_up > 0.5 else "Down",
-        "method": "regression",
+        "method": method_label,
         "details": {
             "regression_prob_up": prob_up,
+            "proxy_ids": proxy_ids,
+            "n_proxies": len(proxy_ids),
             "model_accuracy": regression_result.get("accuracy"),
             "n_features": regression_result.get("n_features"),
             "n_samples": regression_result.get("n_samples"),

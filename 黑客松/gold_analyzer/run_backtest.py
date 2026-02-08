@@ -241,8 +241,8 @@ def main():
                         help="固定概率参数扫描模式")
     parser.add_argument("--model", action="store_true",
                         help="使用 AI 回归模型动态预测每个事件的概率")
-    parser.add_argument("--model-mode", choices=["fast", "full"], default="fast",
-                        help="模型模式: fast=仅回归, full=回归+AI (默认 fast)")
+    parser.add_argument("--model-mode", choices=["fast", "ai_select", "full"], default="fast",
+                        help="模型模式: fast=固定10指标, ai_select=AI选指标+回归, full=AI选指标+回归+AI融合 (默认 fast)")
     parser.add_argument("--refresh", action="store_true",
                         help="强制从 API 重新获取 Polymarket 数据")
     parser.add_argument("--refresh-predictions", action="store_true",
